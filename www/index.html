@@ -97,12 +97,13 @@ const PRE={
  groq:{name:'Groq',base:'https://api.groq.com/openai/v1',model:'openai/gpt-oss-120b',imgModel:'',imgMode:'api'},
  cerebras:{name:'Cerebras',base:'https://api.cerebras.ai/v1',model:'gpt-oss-120b',imgModel:'',imgMode:'api'},
  openrouter:{name:'OpenRouter',base:'https://openrouter.ai/api/v1',model:'openrouter/free',imgModel:'google/gemini-2.5-flash-image',imgMode:'chat'},
- nvidia:{name:'NVIDIA',base:'https://integrate.api.nvidia.com/v1',model:'openai/gpt-oss-120b',imgModel:'',imgMode:'api'},
+ nvidia:{name:'NVIDIA',base:'https://integrate.api.nvidia.com/v1',model:'openai/gpt-oss-120b',imgModel:'black-forest-labs/flux-3-image-klein',imgMode:'nvgenai'},
  mistral:{name:'Mistral',base:'https://api.mistral.ai/v1',model:'mistral-small-latest',imgModel:'',imgMode:'api'},
  openai:{name:'OpenAI',base:'https://api.openai.com/v1',model:'gpt-4o-mini',imgModel:'gpt-image-1',imgMode:'api'}
 };
 let S=Object.assign({theme:'auto',sys:'',temp:'',maxTok:2048,tmo:90,act:'',provs:[]},ld('mt_s',{}));
 if(!S.provs.length){S.provs=Object.keys(PRE).map(k=>Object.assign({id:k,key:''},PRE[k]));S.act='groq'}
+S.provs.forEach(p=>{if(p.id==='nvidia'&&!p.imgModel){p.imgModel='black-forest-labs/flux-3-image-klein';p.imgMode='nvgenai'}});
 let H=ld('mt_h',[]),ATT=[],IMG=false,busy=false;
 const save=()=>sv('mt_s',S);
 const persist=()=>sv('mt_h',H.map(m=>Object.assign({},m,{img:m.img?'':undefined,imgNote:m.img?1:undefined,files:(m.files||[]).map(f=>({name:f.name,size:f.size,kind:f.kind}))})));
@@ -114,12 +115,13 @@ let tt;function toast(t){const e=$('#toast');e.textContent=t;e.style.display='bl
 function el(tag,a,kids){const e=document.createElement(tag);Object.keys(a||{}).forEach(k=>{if(k==='text')e.textContent=a[k];else if(k.startsWith('on'))e[k]=a[k];else if(k==='class')e.className=a[k];else e.setAttribute(k,a[k])});(kids||[]).forEach(c=>e.appendChild(c));return e}
 
 // ---------- API ----------
-async function api(p,path,body,method){
+async function api(p,path,body,method,hx){
  const t0=performance.now();
- const h={'Authorization':'Bearer '+p.key};if(body)h['Content-Type']='application/json';
- const r=await T(fetch(p.base.replace(/\/+$/,'')+path,{method:method||(body?'POST':'GET'),headers:h,body:body?JSON.stringify(body):undefined}),S.tmo*1000);
+ const h=Object.assign({'Authorization':'Bearer '+p.key},hx||{});if(body)h['Content-Type']='application/json';
+ const url=/^https?:/.test(path)?path:p.base.replace(/\/+$/,'')+path;
+ const r=await T(fetch(url,{method:method||(body?'POST':'GET'),headers:h,body:body?JSON.stringify(body):undefined}),S.tmo*1000);
  const txt=await r.text();let j=null;try{j=JSON.parse(txt)}catch(e){}
- return{ok:r.ok,status:r.status,j,txt,ms:Math.round(performance.now()-t0)};
+ return{ok:r.ok,status:r.status,j,txt,hd:r.headers,ms:Math.round(performance.now()-t0)};
 }
 const rawStr=j=>{try{return JSON.stringify(j,(k,v)=>typeof v==='string'&&v.length>300?v.slice(0,120)+'...['+v.length+' chars]':v,1).slice(0,5000)}catch(e){return ''}};
 
@@ -156,8 +158,21 @@ async function runChat(p){
 }
 async function runImage(p,prompt){
  if(!p.imgModel)return{role:'assistant',err:1,content:'Image model is empty for '+p.name+'. Set it in Settings.',meta:{prov:p.name}};
- const meta={prov:p.name,model:p.imgModel,ms:0,img:1};let r,urls=[];
- if(p.imgMode==='chat'){
+ const meta={prov:p.name,model:p.imgModel,ms:0,img:1};let r,urls=[];const T0=performance.now();
+ if(p.imgMode==='nvgenai'){
+  let ex={};try{ex=p.imgExtra&&p.imgExtra.trim()?JSON.parse(p.imgExtra):{}}catch(e){return{role:'assistant',err:1,content:'Image extra params is not valid JSON.',meta}}
+  const body={prompt:prompt,width:1024,height:1024,seed:0,steps:50},call=m=>api(p,'https://ai.api.nvidia.com/v1/genai/'+m,Object.assign(body,ex),'POST',{Accept:'application/json'});
+  let model=p.imgModel;r=await call(model);
+  if(r.status===404){const alt=/flux-3/.test(model)?model.replace('flux-3','flux.3'):model.replace('flux.3','flux-3');
+   if(alt!==model){const r2=await call(alt);if(r2.status!==404){r=r2;model=alt;meta.model=alt;meta.note='used '+alt}}}
+  const id=r.hd&&r.hd.get&&r.hd.get('nvcf-reqid');
+  while(r.status===202&&id&&performance.now()-T0<S.tmo*1000){await new Promise(x=>setTimeout(x,3000));r=await api(p,'https://ai.api.nvidia.com/v1/status/'+id,null,'GET')}
+  if(r.status===202)return{role:'assistant',err:1,content:'Still pending after '+S.tmo+'s (request id '+(id||'none')+'). Raise the timeout in Settings.',meta,raw:rawStr(r.j)};
+  if(r.ok){const j=r.j||{},a=(j.artifacts&&j.artifacts[0])||{},d=(j.data&&j.data[0])||{};
+   const b=a.base64||a.b64_json||j.image||j.b64_json||d.b64_json||d.url||j.url;
+   if(b)urls=[/^(https?:|data:)/.test(b)?b:'data:image/png;base64,'+b];
+   if(a.finishReason&&a.finishReason!=='SUCCESS')meta.fin=a.finishReason}
+ }else if(p.imgMode==='chat'){
   const im=lastImgs().map(f=>({type:'image_url',image_url:{url:f.data}}));
   r=await api(p,'/chat/completions',{model:p.imgModel,messages:[{role:'user',content:im.length?[{type:'text',text:prompt}].concat(im):prompt}],modalities:['image','text']});
   if(r.ok){const mm=(r.j&&r.j.choices&&r.j.choices[0]&&r.j.choices[0].message)||{};urls=(mm.images||[]).map(i=>i.image_url&&i.image_url.url).filter(Boolean);meta.text=typeof mm.content==='string'?mm.content:''}
@@ -165,7 +180,7 @@ async function runImage(p,prompt){
   r=await api(p,'/images/generations',{model:p.imgModel,prompt:prompt,n:1});
   if(r.ok){urls=((r.j&&r.j.data)||[]).map(d=>d.b64_json?'data:image/png;base64,'+d.b64_json:d.url).filter(Boolean)}
  }
- meta.ms=r.ms;
+ meta.ms=Math.round(performance.now()-T0);
  if(!r.ok)return{role:'assistant',err:1,content:'HTTP '+r.status+'\n'+r.txt.replace(/\s+/g,' ').slice(0,600),meta,raw:rawStr(r.j)||r.txt.slice(0,2000)};
  if(!urls.length)return{role:'assistant',err:1,content:'No image in the response.'+(meta.text?'\nModel said: '+meta.text:''),meta,raw:rawStr(r.j)};
  return{role:'assistant',content:meta.text||'',img:urls[0],meta,raw:rawStr(r.j)};
@@ -202,7 +217,7 @@ function render(wait){
   if(m.img)d.appendChild(el('img',{class:'gen',src:m.img}));
   else if(m.imgNote)d.appendChild(el('div',{class:'meta',text:'[image not kept after restart]'}));
   const mt=m.meta||{},meta=el('div',{class:'meta'});
-  [mt.prov,mt.model,mt.ms?mt.ms+' ms':'',mt.tok,mt.fin?'finish: '+mt.fin:''].filter(Boolean).forEach(x=>meta.appendChild(el('span',{text:x})));
+  [mt.prov,mt.model,mt.ms?mt.ms+' ms':'',mt.tok,mt.fin?'finish: '+mt.fin:'',mt.note].filter(Boolean).forEach(x=>meta.appendChild(el('span',{text:x})));
   if(m.content&&!m.err)meta.appendChild(el('button',{text:'Copy',onclick:()=>{navigator.clipboard.writeText(m.content).then(()=>toast('Copied')).catch(()=>toast('Copy failed'))}}));
   d.appendChild(meta);
   if(m.reason)d.appendChild(el('details',{},[el('summary',{text:'Reasoning'}),el('pre',{text:m.reason})]));
@@ -260,9 +275,10 @@ function settings(){
   field('API key',p.key,v=>{p.key=v;save()},'paste key').forEach(x=>c.appendChild(x));
   field('Chat model',p.model,v=>{p.model=v;save();head()},'',('dl_'+p.id)).forEach(x=>c.appendChild(x));
   field('Image model',p.imgModel,v=>{p.imgModel=v;save();head()},'optional').forEach(x=>c.appendChild(x));
-  const sel=el('select',{},[el('option',{value:'api',text:'Images API (/images/generations)'}),el('option',{value:'chat',text:'Chat with image output (OpenRouter style)'})]);
+  const sel=el('select',{},[el('option',{value:'api',text:'Images API (/images/generations)'}),el('option',{value:'chat',text:'Chat with image output (OpenRouter style)'}),el('option',{value:'nvgenai',text:'NVIDIA genai (ai.api.nvidia.com/v1/genai/MODEL)'})]);
   sel.value=p.imgMode||'api';sel.onchange=()=>{p.imgMode=sel.value;save()};
-  c.appendChild(el('label',{text:'Image mode'}));c.appendChild(sel);c.appendChild(dl);
+  c.appendChild(el('label',{text:'Image mode'}));c.appendChild(sel);
+  field('Image extra params (JSON, optional)',p.imgExtra||'',v=>{p.imgExtra=v;save()},'{"steps":20,"seed":0}').forEach(x=>c.appendChild(x));c.appendChild(dl);
   c.appendChild(el('div',{class:'row'},[
    el('button',{class:'btn p',text:'Test chat',onclick:async()=>{
     res.textContent='Testing...';if(!p.key){res.textContent='No key.';return}
